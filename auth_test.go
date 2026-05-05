@@ -235,62 +235,18 @@ func TestHandlePollError(t *testing.T) {
 	}
 }
 
-func TestSaveAndRemoveAuthToken(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-
-	// Save a token
-	if err := saveAuthToken("crit_test_token"); err != nil {
-		t.Fatalf("saveAuthToken: %v", err)
-	}
-
-	// Verify it was written
-	data, err := os.ReadFile(filepath.Join(home, ".crit.config.json"))
-	if err != nil {
-		t.Fatalf("reading config: %v", err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("parsing config: %v", err)
-	}
-	var token string
-	json.Unmarshal(raw["auth_token"], &token)
-	if token != "crit_test_token" {
-		t.Errorf("auth_token = %q, want crit_test_token", token)
-	}
-
-	// Remove the token
-	if err := removeAuthToken(); err != nil {
-		t.Fatalf("removeAuthToken: %v", err)
-	}
-
-	data, err = os.ReadFile(filepath.Join(home, ".crit.config.json"))
-	if err != nil {
-		t.Fatalf("reading config after remove: %v", err)
-	}
-	raw = make(map[string]json.RawMessage)
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("parsing config after remove: %v", err)
-	}
-	if _, ok := raw["auth_token"]; ok {
-		t.Error("auth_token should be removed after removeAuthToken")
-	}
-}
-
 func TestSaveGlobalConfig_PreservesUnknownKeys(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	// Write a config with an existing key
+	// Write a config with existing keys.
 	initial := `{"share_url": "https://example.com", "port": 3000}` + "\n"
 	os.WriteFile(filepath.Join(home, ".crit.config.json"), []byte(initial), 0o600)
 
-	// Save auth_token
-	if err := saveAuthToken("crit_tok"); err != nil {
-		t.Fatalf("saveAuthToken: %v", err)
+	if err := saveAuthSession(tokenResponse{AccessToken: "crit_tok"}); err != nil {
+		t.Fatalf("saveAuthSession: %v", err)
 	}
 
-	// Verify both old keys and new key are present
 	data, err := os.ReadFile(filepath.Join(home, ".crit.config.json"))
 	if err != nil {
 		t.Fatalf("reading config: %v", err)
@@ -315,8 +271,8 @@ func TestSaveGlobalConfig_FilePermissions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	if err := saveAuthToken("crit_tok"); err != nil {
-		t.Fatalf("saveAuthToken: %v", err)
+	if err := saveAuthSession(tokenResponse{AccessToken: "crit_tok"}); err != nil {
+		t.Fatalf("saveAuthSession: %v", err)
 	}
 
 	info, err := os.Stat(filepath.Join(home, ".crit.config.json"))
@@ -727,16 +683,16 @@ func TestPollForToken_Integration(t *testing.T) {
 	}
 }
 
-// TestSaveAuthIdentity_OverwritesStaleFields verifies that re-login replaces
-// every identity field, even when the new token response omits some of them.
-// This guards against the prod regression where a previous account's
-// auth_user_id survived a login as a different user, causing the daemon to
-// stamp the wrong user_id into shared comments.
-func TestSaveAuthIdentity_OverwritesStaleFields(t *testing.T) {
+// TestSaveAuthSession_AtomicRewrite verifies that saveAuthSession writes the
+// bearer token and all identity fields in a single atomic config write,
+// guarding against the prod regression (#371) where stale identity from a
+// previous login survived re-login because the bearer and identity were
+// persisted in two separate writes.
+func TestSaveAuthSession_AtomicRewrite(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
-	// Seed config with stale identity from a previous login (different user).
+	// Seed config with a full session from a previous user.
 	initial := `{
 		"auth_token": "old_token",
 		"auth_user_id": "old-uuid",
@@ -747,15 +703,14 @@ func TestSaveAuthIdentity_OverwritesStaleFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// New login as a different user.
-	newToken := tokenResponse{
+	// New login as a different user — every field should change.
+	if err := saveAuthSession(tokenResponse{
 		AccessToken: "new_token",
 		UserID:      "new-uuid",
 		UserName:    "New User",
 		UserEmail:   "new@example.com",
-	}
-	if err := saveAuthIdentity(newToken); err != nil {
-		t.Fatalf("saveAuthIdentity: %v", err)
+	}); err != nil {
+		t.Fatalf("saveAuthSession: %v", err)
 	}
 
 	data, err := os.ReadFile(filepath.Join(home, ".crit.config.json"))
@@ -775,20 +730,22 @@ func TestSaveAuthIdentity_OverwritesStaleFields(t *testing.T) {
 			t.Errorf("%s = %q, want %q", key, got, want)
 		}
 	}
+	check("auth_token", "new_token")
 	check("auth_user_id", "new-uuid")
 	check("auth_user_name", "New User")
 	check("auth_user_email", "new@example.com")
 }
 
-// TestSaveAuthIdentity_RemovesFieldsAbsentFromResponse verifies that when the
-// server returns an empty user_id (older crit-web), the existing key is
-// removed from disk rather than silently retained — otherwise the daemon
-// would keep stamping the previous user's id forever.
-func TestSaveAuthIdentity_RemovesFieldsAbsentFromResponse(t *testing.T) {
+// TestSaveAuthSession_RemovesFieldsAbsentFromResponse verifies that an older
+// crit-web that returns an empty user_id causes the existing key to be
+// removed from disk in the same write — preventing stale identity from
+// surviving a re-login when the new token response is partial.
+func TestSaveAuthSession_RemovesFieldsAbsentFromResponse(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
 	initial := `{
+		"auth_token": "old_token",
 		"auth_user_id": "stale-uuid",
 		"auth_user_name": "Stale User",
 		"auth_user_email": "stale@example.com"
@@ -797,12 +754,12 @@ func TestSaveAuthIdentity_RemovesFieldsAbsentFromResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Older server: only returns user_name; no user_id, no user_email.
-	if err := saveAuthIdentity(tokenResponse{
-		AccessToken: "tok",
+	// Older server: returns token + name only.
+	if err := saveAuthSession(tokenResponse{
+		AccessToken: "fresh_token",
 		UserName:    "Just Name",
 	}); err != nil {
-		t.Fatalf("saveAuthIdentity: %v", err)
+		t.Fatalf("saveAuthSession: %v", err)
 	}
 
 	data, _ := os.ReadFile(filepath.Join(home, ".crit.config.json"))
@@ -815,8 +772,12 @@ func TestSaveAuthIdentity_RemovesFieldsAbsentFromResponse(t *testing.T) {
 	if _, ok := raw["auth_user_email"]; ok {
 		t.Error("auth_user_email should be removed when token response omits it")
 	}
-	var name string
+	var token, name string
+	json.Unmarshal(raw["auth_token"], &token)
 	json.Unmarshal(raw["auth_user_name"], &name)
+	if token != "fresh_token" {
+		t.Errorf("auth_token = %q, want fresh_token", token)
+	}
 	if name != "Just Name" {
 		t.Errorf("auth_user_name = %q, want Just Name", name)
 	}
