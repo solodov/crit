@@ -554,7 +554,8 @@ func ResolveDefaultBranchSHA(vcs VCS, repoRoot, defaultBranch string) (string, e
 	if vcs == nil || defaultBranch == "" {
 		return "", fmt.Errorf("default branch unknown")
 	}
-	if vcs.Name() == "git" {
+	switch vcs.Name() {
+	case "git":
 		if out, err := runGitInDir(repoRoot, "rev-parse", "--verify", "origin/"+defaultBranch); err == nil {
 			return strings.TrimSpace(out), nil
 		}
@@ -562,15 +563,27 @@ func ResolveDefaultBranchSHA(vcs VCS, repoRoot, defaultBranch string) (string, e
 			return strings.TrimSpace(out), nil
 		}
 		return "", fmt.Errorf("could not resolve %s tip", defaultBranch)
+	case "jj":
+		if defaultBranch == jjTrunkRevset {
+			_, sha := resolveJJDefaultBaseInDir(repoRoot)
+			if sha != "" {
+				return sha, nil
+			}
+		}
+		if sha, err := resolveJJRevisionToCommitID(repoRoot, defaultBranch); err == nil && strings.TrimSpace(sha) != "" {
+			return strings.TrimSpace(sha), nil
+		}
+		return "", fmt.Errorf("could not resolve %s tip", defaultBranch)
+	default:
+		// Sapling: try remote bookmark, then local.
+		if out, err := slCommandInDir(repoRoot, "log", "-r", "remote/"+defaultBranch, "-T", "{node}"); err == nil && strings.TrimSpace(out) != "" {
+			return strings.TrimSpace(out), nil
+		}
+		if out, err := slCommandInDir(repoRoot, "log", "-r", defaultBranch, "-T", "{node}"); err == nil && strings.TrimSpace(out) != "" {
+			return strings.TrimSpace(out), nil
+		}
+		return "", fmt.Errorf("could not resolve %s tip", defaultBranch)
 	}
-	// Sapling: try remote bookmark, then local.
-	if out, err := slCommandInDir(repoRoot, "log", "-r", "remote/"+defaultBranch, "-T", "{node}"); err == nil && strings.TrimSpace(out) != "" {
-		return strings.TrimSpace(out), nil
-	}
-	if out, err := slCommandInDir(repoRoot, "log", "-r", defaultBranch, "-T", "{node}"); err == nil && strings.TrimSpace(out) != "" {
-		return strings.TrimSpace(out), nil
-	}
-	return "", fmt.Errorf("could not resolve %s tip", defaultBranch)
 }
 
 // walkAncestors enumerates HEAD-first the recent ancestor SHAs that are
@@ -579,21 +592,29 @@ func walkAncestors(vcs VCS, repoRoot string, maxDepth int) ([]string, error) {
 	if vcs == nil {
 		return nil, nil
 	}
-	if vcs.Name() == "git" {
+	switch vcs.Name() {
+	case "git":
 		out, err := runGitInDir(repoRoot, "rev-list", "--first-parent", "-n", strconv.Itoa(maxDepth), "HEAD")
 		if err != nil {
 			return nil, err
 		}
 		return splitNonEmpty(out), nil
+	case "jj":
+		out, err := jjCommandInDir(repoRoot, "log", "-r", jjTopicChainRevset(repoRoot, maxDepth), "--no-graph", "-T", "commit_id ++ \"\\n\"")
+		if err != nil {
+			return nil, err
+		}
+		return splitNonEmpty(out), nil
+	default:
+		// Sapling: ancestors of `.` that are still draft.
+		out, err := slCommandInDir(repoRoot, "log", "-r",
+			fmt.Sprintf("ancestors(., %d) & draft()", maxDepth),
+			"-T", "{node}\n")
+		if err != nil {
+			return nil, err
+		}
+		return splitNonEmpty(out), nil
 	}
-	// Sapling: ancestors of `.` that are still draft.
-	out, err := slCommandInDir(repoRoot, "log", "-r",
-		fmt.Sprintf("ancestors(., %d) & draft()", maxDepth),
-		"-T", "{node}\n")
-	if err != nil {
-		return nil, err
-	}
-	return splitNonEmpty(out), nil
 }
 
 // localBranchTips returns SHAs that have a useful local label, mapped to that
@@ -618,6 +639,27 @@ func localBranchTips(vcs VCS, repoRoot string) (map[string]string, error) {
 		return result, nil
 	}
 	result := make(map[string]string)
+	if vcs.Name() == "jj" {
+		if bookmarks, err := jjCommandInDir(repoRoot, "bookmark", "list", "-T", "normal_target.commit_id() ++ \" \" ++ name ++ \"\\n\""); err == nil {
+			for _, line := range splitNonEmpty(bookmarks) {
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) == 2 {
+					result[parts[0]] = parts[1]
+				}
+			}
+		}
+		if drafts, err := jjCommandInDir(repoRoot, "log", "-r", jjTopicChainRevset(repoRoot, 0), "--no-graph", "-T", "commit_id ++ \" \" ++ description.first_line() ++ \"\\n\""); err == nil {
+			for _, line := range splitNonEmpty(drafts) {
+				parts := strings.SplitN(line, " ", 2)
+				if len(parts) == 2 {
+					if _, ok := result[parts[0]]; !ok {
+						result[parts[0]] = parts[1]
+					}
+				}
+			}
+		}
+		return result, nil
+	}
 	if bookmarks, err := slCommandInDir(repoRoot, "bookmarks", "-T", "{node} {bookmark}\n"); err == nil {
 		for _, line := range splitNonEmpty(bookmarks) {
 			parts := strings.SplitN(line, " ", 2)
@@ -646,10 +688,14 @@ func remoteBranchTips(vcs VCS, repoRoot, defaultBranch string) ([]BranchEntry, e
 	if vcs == nil {
 		return nil, nil
 	}
-	if vcs.Name() == "git" {
+	switch vcs.Name() {
+	case "git":
 		return remoteBranchTipsGit(repoRoot, defaultBranch)
+	case "jj":
+		return remoteBranchTipsJJ(repoRoot, defaultBranch)
+	default:
+		return remoteBranchTipsSapling(repoRoot, defaultBranch)
 	}
-	return remoteBranchTipsSapling(repoRoot, defaultBranch)
 }
 
 func remoteBranchTipsGit(repoRoot, defaultBranch string) ([]BranchEntry, error) {
@@ -673,6 +719,37 @@ func remoteBranchTipsGit(repoRoot, defaultBranch string) ([]BranchEntry, error) 
 		if name == "origin/"+defaultBranch || name == defaultBranch {
 			continue
 		}
+		entries = append(entries, BranchEntry{Name: name, HeadSHA: parts[0]})
+		if len(entries) >= 20 {
+			break
+		}
+	}
+	return entries, nil
+}
+
+func remoteBranchTipsJJ(repoRoot, defaultBranch string) ([]BranchEntry, error) {
+	out, err := jjCommandInDir(repoRoot, "bookmark", "list", "--all-remotes", "-T", "normal_target.commit_id() ++ \" \" ++ name ++ \"@\" ++ remote ++ \"\\n\"")
+	if err != nil {
+		return nil, nil //nolint:nilerr // best-effort; remote bookmarks may not be configured
+	}
+	seen := make(map[string]bool)
+	var entries []BranchEntry
+	for _, line := range splitNonEmpty(out) {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[1])
+		if !strings.Contains(name, "@") || strings.HasSuffix(name, "@") || strings.HasSuffix(name, "@git") || name == "@" {
+			continue
+		}
+		if strings.TrimSuffix(name, "@origin") == defaultBranch || strings.TrimSuffix(name, "@upstream") == defaultBranch {
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
 		entries = append(entries, BranchEntry{Name: name, HeadSHA: parts[0]})
 		if len(entries) >= 20 {
 			break
@@ -855,6 +932,7 @@ var skipDirs = map[string]bool{
 	"vendor":       true,
 	"__pycache__":  true,
 	".git":         true,
+	".jj":          true,
 	".sl":          true,
 	"dist":         true,
 	"build":        true,

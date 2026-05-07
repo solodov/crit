@@ -19,7 +19,7 @@ crit/
 ├── share.go             # Share/unpublish to crit-web, share CLI subcommand
 ├── plans.go             # Plan file detection and handling
 ├── integrations.go      # Integration config installation (crit install <agent>)
-├── vcs.go / git_vcs.go / sapling.go / sapling_parse.go  # VCS abstraction (git + sapling)
+├── vcs.go / git_vcs.go / sapling.go / jj.go  # VCS abstraction (git + sapling + jj)
 ├── auth.go              # Hosted crit-web auth flow (login/logout, token storage)
 ├── focus_*.go / picker.go  # Focus mode (range, stacked) + file picker backend
 ├── review_file.go       # Review file (~/.crit/reviews/<key>.json) read/write — saveCritJSON
@@ -58,7 +58,7 @@ crit/
 12. **Headless CLI comment** — `crit comment` writes directly to the review file without starting the server; SSE notifies any running server
 13. **Comment threading** — comments support nested replies and a `resolved` boolean. Review file schema nests replies inside each comment's `replies` array.
 14. **Centralized review storage** — `~/.crit/reviews/<key>.json` keyed by cwd + branch (git mode) or cwd + args (file mode)
-15. **VCS abstraction** — `vcs.go` defines a backend interface; `git_vcs.go` and `sapling.go` are the implementations. Auto-detected, overridable via `--vcs` flag or `vcs` config key. Subcommands not yet threaded through (see TODO at `main.go:1826`).
+15. **VCS abstraction** — `vcs.go` defines a backend interface; `git_vcs.go`, `sapling.go`, and `jj.go` are the implementations. Auto-detected, overridable via `--vcs` flag or `vcs` config key. Subcommands not yet threaded through (see TODO at `main.go:1826`).
 16. **Focus mode** — sub-views over the file list: file focus, range focus (`--range A..B`), stacked focus (range layer in a stacked PR). Lives in `focus_*.go` and `/api/focus`.
 
 <important if="you need to build, test, lint, or run crit">
@@ -117,11 +117,11 @@ Two-level JSON config files, merged (project overrides global):
 Config keys: `port`, `no_open`, `share_url`, `quiet`, `output`, `author`, `base_branch`, `ignore_patterns`, `agent_cmd`, `auth_token`, `auth_user_name`, `auth_user_email`, `auth_user_id`, `cleanup_on_approve`, `no_update_check`, `no_integration_check`, `vcs`.
 
 - `base_branch` overrides auto-detected default branch (used as diff base in git mode, and by `crit pull`/`crit push`/`crit comment`)
-- `author` falls back to `git config user.name` if not set
+- `author` falls back to the configured VCS user name if not set
 - `agent_cmd` is **global config only**; project-level config cannot override (security)
 - `cleanup_on_approve` (default: `true`) — auto-delete review file when reviewer approves with no unresolved comments
 - `ignore_patterns` are unioned (global + project both apply); types: `*.ext`, `dir/`, `exact.file`, `path/*.ext`
-- `vcs` selects backend: `"git"` (default) or `"sl"` (sapling)
+- `vcs` selects backend: `"git"` (default), `"sl"` (sapling), or `"jj"` (Jujutsu)
 - `auth_*` keys hold cached hosted-crit-web credentials (set by `crit auth`); treat as secrets
 - CLI flags override config file values
 </important>

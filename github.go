@@ -414,6 +414,9 @@ func ensureSHAFetched(vcs VCS, sha, repoRoot, forkURL string) error {
 	if vcs.Name() == "sl" {
 		return ensureSHAFetchedSapling(vcs, sha, repoRoot, forkURL)
 	}
+	if vcs.Name() == "jj" {
+		return ensureSHAFetchedJJ(vcs, sha, repoRoot, forkURL)
+	}
 	if vcs.Name() != "git" {
 		return fmt.Errorf("commit %s not present locally (auto-fetch not supported for vcs=%q)", sha, vcs.Name())
 	}
@@ -433,6 +436,28 @@ func ensureSHAFetched(vcs VCS, sha, repoRoot, forkURL string) error {
 		return fmt.Errorf("commit %s not present locally; tried origin and fork %s — manual fetch required", sha, forkURL)
 	}
 	return fmt.Errorf("commit %s not present locally; manual fetch required (run `git fetch <remote> %s`)", sha, sha)
+}
+
+// ensureSHAFetchedJJ falls back to git fetch for colocated JJ/Git repos. Pure
+// JJ repos do not expose a stable command for fetching an arbitrary commit id
+// from an arbitrary URL, so range/PR focus reports a clear manual-fetch error.
+func ensureSHAFetchedJJ(vcs VCS, sha, repoRoot, forkURL string) error {
+	if hasGitDirAt(repoRoot) {
+		if err := tryGitFetch(repoRoot, "origin", sha); err == nil && vcs.HasObject(sha, repoRoot) {
+			return nil
+		}
+		if forkURL != "" {
+			if err := tryGitFetch(repoRoot, forkURL, sha); err == nil && vcs.HasObject(sha, repoRoot) {
+				return nil
+			}
+			return fmt.Errorf("commit %s not present locally; tried `git fetch origin %s` and `git fetch %s %s` for colocated JJ repo — manual fetch required", sha, sha, forkURL, sha)
+		}
+		return fmt.Errorf("commit %s not present locally; manual fetch required (run `git fetch <remote> %s` in the colocated JJ repo)", sha, sha)
+	}
+	if forkURL != "" {
+		return fmt.Errorf("commit %s not present locally; PR head is on fork %s. Pure JJ auto-fetch is not supported — fetch it manually and re-run", sha, forkURL)
+	}
+	return fmt.Errorf("commit %s not present locally; pure JJ auto-fetch is not supported — fetch it manually and re-run", sha)
 }
 
 // ensureSHAFetchedSapling tries `sl pull -r <sha>` first, then falls back to

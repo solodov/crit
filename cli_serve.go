@@ -34,7 +34,7 @@ type serverConfig struct {
 	planDir            string // managed storage directory for plan mode
 	planName           string // display name for plan content
 	reviewPath         string // centralized review file path (~/.crit/reviews/<key>.json)
-	vcsOverride        string // "git", "sl"/"sapling", or "" for auto-detect
+	vcsOverride        string // "git", "sl"/"sapling", "jj"/"jujutsu", or "" for auto-detect
 	cfg                Config // full resolved config for the settings panel
 
 	// focus is populated by resolveFocus when --pr or --range is set;
@@ -86,7 +86,7 @@ func parseServerFlags(args []string) serverFlagSet {
 	fs.BoolVar(quiet, "q", false, "Suppress status output (shorthand)")
 	noIgnore := fs.Bool("no-ignore", false, "Disable all ignore patterns from config files")
 	baseBranch := fs.String("base-branch", "", "Base branch to diff against (overrides auto-detection)")
-	vcsFlag := fs.String("vcs", "", "VCS backend to use: git, sl/sapling (default: auto-detect)")
+	vcsFlag := fs.String("vcs", "", "VCS backend to use: git, sl/sapling, jj/jujutsu (default: auto-detect)")
 	planDir := fs.String("plan-dir", "", "")
 	planName := fs.String("name", "", "")
 	prSpec := fs.String("pr", "", "Review a specific PR by number or URL (e.g. 295 or https://github.com/o/r/pull/295)")

@@ -28,7 +28,7 @@ type Config struct {
 	AuthUserEmail      string   `json:"auth_user_email,omitempty"`
 	AuthUserID         string   `json:"auth_user_id,omitempty"`
 	CleanupOnApprove   *bool    `json:"cleanup_on_approve,omitempty"`
-	VCS                string   `json:"vcs,omitempty"` // preferred VCS backend: "git", "sl"
+	VCS                string   `json:"vcs,omitempty"` // preferred VCS backend: "git", "sl", "jj"
 }
 
 // CleanupOnApproveEnabled returns whether review files should be cleaned up
@@ -234,6 +234,11 @@ func LoadConfig(projectDir string) Config {
 		switch merged.VCS {
 		case "sl", "sapling":
 			merged.Author = slUserName()
+			if merged.Author == "" {
+				merged.Author = gitUserName()
+			}
+		case "jj", "jujutsu":
+			merged.Author = jjUserName()
 			if merged.Author == "" {
 				merged.Author = gitUserName()
 			}
