@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -98,6 +99,7 @@ func TestIntegrationMap_SnapshotGlobalRouting(t *testing.T) {
 		"github-copilot": {{".agents/skills/crit/SKILL.md", globalDestRelHome}, {".agents/skills/crit-cli/SKILL.md", globalDestRelHome}},
 		"windsurf":       {{"", globalDestNone}},
 		"cline":          {{"Cline/Rules/crit.md", globalDestDocuments}},
+		"gemini":         {{".gemini/skills/crit-cli/SKILL.md", globalDestRelHome}, {".gemini/commands/crit.toml", globalDestRelHome}, {".gemini/policies/crit.toml", globalDestRelHome}},
 	}
 	for tool, files := range expected {
 		got := integrationMap[tool]
@@ -144,10 +146,146 @@ func TestInstallOneFile_WritesAndSkips(t *testing.T) {
 	}
 }
 
+// TestInstallIntegration_GeminiWritesSettingsJSON verifies that the gemini
+// special-case in installIntegration runs installGeminiSettings and produces
+// a .gemini/settings.json in the project directory.
+func TestInstallIntegration_GeminiWritesSettingsJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := installIntegration("gemini", false); err != nil {
+		t.Fatalf("installIntegration: %v", err)
+	}
+	settingsPath := filepath.Join(dir, ".gemini", "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("expected .gemini/settings.json to be written: %v", err)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("settings.json is not valid JSON: %v", err)
+	}
+	hooks, _ := m["hooks"].(map[string]interface{})
+	before, _ := hooks["BeforeTool"].([]interface{})
+	for _, e := range before {
+		if em, ok := e.(map[string]interface{}); ok && em["matcher"] == "exit_plan_mode" {
+			return
+		}
+	}
+	t.Error("exit_plan_mode hook not found in .gemini/settings.json")
+}
+
 func TestPrintUniqueHints_Dedups(t *testing.T) {
 	// printUniqueHints prints to stdout; we just verify it doesn't panic on
 	// duplicates and empty input. Output ordering and dedup logic are simple
 	// enough that visual inspection during integration use covers the rest.
 	printUniqueHints(nil)
 	printUniqueHints([]string{"a", "b", "a", "c", "b"})
+}
+
+func TestInstallGeminiSettings(t *testing.T) {
+	hookEntry := func(data []byte) bool {
+		var m map[string]interface{}
+		if err := json.Unmarshal(data, &m); err != nil {
+			return false
+		}
+		hooks, _ := m["hooks"].(map[string]interface{})
+		before, _ := hooks["BeforeTool"].([]interface{})
+		for _, e := range before {
+			em, ok := e.(map[string]interface{})
+			if ok && em["matcher"] == "exit_plan_mode" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("creates file with hook when absent", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		installGeminiSettings(path, false)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("expected settings.json to be written: %v", err)
+		}
+		if !hookEntry(data) {
+			t.Errorf("exit_plan_mode hook not found in %s", data)
+		}
+	})
+
+	t.Run("skips when hook already present and no force", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		// Write a valid settings.json that already has the hook plus a sentinel field.
+		prebuilt := `{"hooks":{"BeforeTool":[{"matcher":"exit_plan_mode","hooks":[{"type":"command","command":"crit plan-hook","timeout":345600000}]}]},"sentinel":true}` + "\n"
+		_ = os.WriteFile(path, []byte(prebuilt), 0o644)
+		installGeminiSettings(path, false)
+		got, _ := os.ReadFile(path)
+		if string(got) != prebuilt {
+			t.Errorf("no-force should skip; file was modified:\ngot:  %s\nwant: %s", got, prebuilt)
+		}
+	})
+
+	t.Run("force overwrites existing hook entry", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		// write a settings file with a stale exit_plan_mode entry
+		stale := `{"hooks":{"BeforeTool":[{"matcher":"exit_plan_mode","hooks":[{"type":"command","command":"old-cmd","timeout":1}]}]}}`
+		_ = os.WriteFile(path, []byte(stale), 0o644)
+		installGeminiSettings(path, true)
+		data, _ := os.ReadFile(path)
+		var m map[string]interface{}
+		_ = json.Unmarshal(data, &m)
+		hooks, _ := m["hooks"].(map[string]interface{})
+		before, _ := hooks["BeforeTool"].([]interface{})
+		// exactly one exit_plan_mode entry
+		count := 0
+		for _, e := range before {
+			em, ok := e.(map[string]interface{})
+			if ok && em["matcher"] == "exit_plan_mode" {
+				count++
+				inner, _ := em["hooks"].([]interface{})
+				if len(inner) > 0 {
+					cmd, _ := inner[0].(map[string]interface{})["command"].(string)
+					if cmd == "old-cmd" {
+						t.Error("stale command not replaced")
+					}
+				}
+			}
+		}
+		if count != 1 {
+			t.Errorf("expected exactly 1 exit_plan_mode entry, got %d", count)
+		}
+	})
+
+	t.Run("preserves existing unrelated hooks", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "settings.json")
+		existing := `{"hooks":{"BeforeTool":[{"matcher":"other_tool","hooks":[{"type":"command","command":"other"}]}]}}`
+		_ = os.WriteFile(path, []byte(existing), 0o644)
+		installGeminiSettings(path, false)
+		data, _ := os.ReadFile(path)
+		var m map[string]interface{}
+		_ = json.Unmarshal(data, &m)
+		hooks, _ := m["hooks"].(map[string]interface{})
+		before, _ := hooks["BeforeTool"].([]interface{})
+		hasOther, hasCrit := false, false
+		for _, e := range before {
+			em, ok := e.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			switch em["matcher"] {
+			case "other_tool":
+				hasOther = true
+			case "exit_plan_mode":
+				hasCrit = true
+			}
+		}
+		if !hasOther {
+			t.Error("pre-existing other_tool hook was removed")
+		}
+		if !hasCrit {
+			t.Error("exit_plan_mode hook not added")
+		}
+	})
 }

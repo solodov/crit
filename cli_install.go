@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -127,6 +128,11 @@ var integrationMap = map[string][]integration{
 		{source: "integrations/codex/skills/crit/SKILL.md", dest: ".agents/skills/crit/SKILL.md", hint: "Use $crit in Codex to start a review loop"},
 		{source: "integrations/codex/skills/crit-cli/SKILL.md", dest: ".agents/skills/crit-cli/SKILL.md", hint: "The crit-cli skill is available to Codex agents when needed"},
 	},
+	"gemini": {
+		{source: "integrations/gemini/skills/crit-cli/SKILL.md", dest: ".gemini/skills/crit-cli/SKILL.md", globalDest: ".gemini/skills/crit-cli/SKILL.md", globalDestKind: globalDestRelHome, hint: "The crit-cli skill is available to Gemini CLI agents when needed"},
+		{source: "integrations/gemini/commands/crit.toml", dest: ".gemini/commands/crit.toml", globalDest: ".gemini/commands/crit.toml", globalDestKind: globalDestRelHome, hint: "Run /crit in Gemini CLI to start a review loop"},
+		{source: "integrations/gemini/hooks/policy.toml", dest: ".gemini/policies/crit.toml", globalDest: ".gemini/policies/crit.toml", globalDestKind: globalDestRelHome, hint: "The crit policy allows exit_plan_mode without confirmation"},
+	},
 }
 
 // availableIntegrations returns the sorted list of integration names that
@@ -248,6 +254,13 @@ func installIntegration(name string, force bool) error {
 			hints = append(hints, f.hint)
 		}
 	}
+	if name == "gemini" {
+		settingsPath := filepath.Join(".gemini", "settings.json")
+		if global {
+			settingsPath = filepath.Join(home, ".gemini", "settings.json")
+		}
+		installGeminiSettings(settingsPath, force)
+	}
 	printUniqueHints(hints)
 	fmt.Println()
 	return nil
@@ -286,6 +299,70 @@ func installOneFile(f integration, dest string, force bool) {
 		os.Exit(1)
 	}
 	fmt.Printf("  Installed: %s\n", dest)
+}
+
+// installGeminiSettings merges the crit plan-hook into .gemini/settings.json,
+// creating the file if it doesn't exist. Idempotent: skips if the
+// exit_plan_mode hook is already present (unless --force).
+func installGeminiSettings(path string, force bool) {
+	existing := map[string]interface{}{}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &existing); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %s contains invalid JSON — use --force to overwrite\n", path)
+			os.Exit(1)
+		}
+	}
+
+	hooks, _ := existing["hooks"].(map[string]interface{})
+	if hooks == nil {
+		hooks = map[string]interface{}{}
+	}
+	before, _ := hooks["BeforeTool"].([]interface{})
+
+	for _, entry := range before {
+		m, ok := entry.(map[string]interface{})
+		if !ok || m["matcher"] != "exit_plan_mode" {
+			continue
+		}
+		if !force {
+			fmt.Printf("  Skipped:   %s (hooks already configured, use --force to overwrite)\n", path)
+			return
+		}
+		// force: strip the existing entry and re-add below
+		var next []interface{}
+		for _, e := range before {
+			if mm, ok2 := e.(map[string]interface{}); ok2 && mm["matcher"] == "exit_plan_mode" {
+				continue
+			}
+			next = append(next, e)
+		}
+		before = next
+		break
+	}
+
+	before = append(before, map[string]interface{}{
+		"matcher": "exit_plan_mode",
+		"hooks": []interface{}{
+			map[string]interface{}{
+				"type":    "command",
+				"command": "crit plan-hook",
+				"timeout": 345600000,
+			},
+		},
+	})
+	hooks["BeforeTool"] = before
+	existing["hooks"] = hooks
+
+	data, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	if err := atomicWriteFile(path, append(data, '\n'), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing %s: %v\n", path, err)
+		os.Exit(1)
+	}
+	fmt.Printf("  Installed: %s\n", path)
 }
 
 // printUniqueHints prints each hint once, in the order it first appeared.
