@@ -71,20 +71,57 @@ func TestClientExitsOnFinish(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+
+	// On Windows the daemon polls `git status` every second (watch.go) and
+	// runs other git/gh subprocesses during diff/PR work. Each child inherits
+	// repoDir as its cwd, so each holds a directory handle. terminateProcess
+	// on the daemon PID alone leaks any child still in flight, and t.TempDir's
+	// RemoveAll then fails with "file in use by another process". The Job
+	// Object collects the entire tree (parent client + daemon + every
+	// descendant) so we can tear it all down atomically on cleanup. Unix is
+	// a no-op — SIGTERM to the daemon is enough there.
+	group, err := newProcessGroup()
+	if err != nil {
+		t.Fatalf("create process group: %v", err)
+	}
+	t.Cleanup(group.close)
+
+	if err := group.startInGroup(cmd); err != nil {
 		t.Fatalf("start crit: %v", err)
 	}
 
-	// Whatever happens, don't leave the client (or its daemon) running.
+	// `crit` spawns a daemon, registers a session file, then connects to it.
+	// Pick the port out of the session file rather than parsing stdout/stderr.
+	entry := waitForDaemonSession(t, resolvedHome, resolvedRepo)
+	port := entry.Port
+
+	// Whatever happens, don't leave the client (or its daemon, or any of the
+	// daemon's git/gh/sl children) running. On Windows the Job Object set up
+	// above lets us terminate the entire tree atomically; on Unix we fall
+	// back to terminateProcess on the known daemon PID plus killing the
+	// parent client. This Cleanup runs before the t.TempDir RemoveAll
+	// (LIFO ordering: registered after t.TempDir).
 	t.Cleanup(func() {
+		group.killAll()
+		if entry.PID > 0 {
+			if proc, err := os.FindProcess(entry.PID); err == nil {
+				_ = terminateProcess(proc)
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					if !processExists(proc) {
+						break
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				if processExists(proc) {
+					_ = proc.Kill()
+				}
+			}
+		}
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
 	})
-
-	// `crit` spawns a daemon, registers a session file, then connects to it.
-	// Pick the port out of the session file rather than parsing stdout/stderr.
-	port := waitForDaemonPort(t, resolvedHome, resolvedRepo)
 
 	waitForSessionReady(t, port)
 
@@ -166,9 +203,10 @@ func clientFinishEnv(homeDir string) []string {
 	return out
 }
 
-// waitForDaemonPort polls ~/.crit/sessions for the session file the client's
-// daemon should have written, returns its Port. Fails the test on timeout.
-func waitForDaemonPort(t *testing.T, homeDir, cwd string) int {
+// waitForDaemonSession polls ~/.crit/sessions for the session file the
+// client's daemon should have written and returns the parsed entry (Port and
+// PID — the test cleanup needs both). Fails the test on timeout.
+func waitForDaemonSession(t *testing.T, homeDir, cwd string) sessionEntry {
 	t.Helper()
 	key := sessionKey(cwd, "main", nil)
 	sessionPath := filepath.Join(homeDir, ".crit", "sessions", key+".json")
@@ -177,14 +215,14 @@ func waitForDaemonPort(t *testing.T, homeDir, cwd string) int {
 		data, err := os.ReadFile(sessionPath)
 		if err == nil {
 			var entry sessionEntry
-			if err := json.Unmarshal(data, &entry); err == nil && entry.Port > 0 {
-				return entry.Port
+			if err := json.Unmarshal(data, &entry); err == nil && entry.Port > 0 && entry.PID > 0 {
+				return entry
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatalf("daemon did not write session file at %s within 15s", sessionPath)
-	return 0
+	return sessionEntry{}
 }
 
 // waitForSessionReady blocks until /api/session returns 200 (the daemon
