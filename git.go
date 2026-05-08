@@ -618,67 +618,65 @@ func walkAncestors(vcs VCS, repoRoot string, maxDepth int) ([]string, error) {
 }
 
 // localBranchTips returns SHAs that have a useful local label, mapped to that
-// label. For git: refs/heads/ entries. For sapling: bookmarks (when present)
-// plus draft commit first-line descriptions for stack labels.
+// label. For git: refs/heads/ entries. For sapling/JJ: bookmarks when present,
+// plus in-progress commit descriptions for stack labels.
 func localBranchTips(vcs VCS, repoRoot string) (map[string]string, error) {
 	if vcs == nil {
 		return nil, nil
 	}
-	if vcs.Name() == "git" {
-		out, err := runGitInDir(repoRoot, "for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads/")
-		if err != nil {
-			return nil, err
-		}
-		result := make(map[string]string)
-		for _, line := range splitNonEmpty(out) {
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) == 2 {
-				result[parts[0]] = parts[1]
-			}
-		}
-		return result, nil
+	switch vcs.Name() {
+	case "git":
+		return localBranchTipsGit(repoRoot)
+	case "jj":
+		return localBranchTipsJJ(repoRoot), nil
+	default:
+		return localBranchTipsSapling(repoRoot), nil
+	}
+}
+
+func localBranchTipsGit(repoRoot string) (map[string]string, error) {
+	out, err := runGitInDir(repoRoot, "for-each-ref", "--format=%(objectname) %(refname:short)", "refs/heads/")
+	if err != nil {
+		return nil, err
 	}
 	result := make(map[string]string)
-	if vcs.Name() == "jj" {
-		if bookmarks, err := jjCommandInDir(repoRoot, "bookmark", "list", "-T", "normal_target.commit_id() ++ \" \" ++ name ++ \"\\n\""); err == nil {
-			for _, line := range splitNonEmpty(bookmarks) {
-				parts := strings.SplitN(line, " ", 2)
-				if len(parts) == 2 {
-					result[parts[0]] = parts[1]
-				}
-			}
-		}
-		if drafts, err := jjCommandInDir(repoRoot, "log", "-r", jjTopicChainRevset(repoRoot, 0), "--no-graph", "-T", "commit_id ++ \" \" ++ description.first_line() ++ \"\\n\""); err == nil {
-			for _, line := range splitNonEmpty(drafts) {
-				parts := strings.SplitN(line, " ", 2)
-				if len(parts) == 2 {
-					if _, ok := result[parts[0]]; !ok {
-						result[parts[0]] = parts[1]
-					}
-				}
-			}
-		}
-		return result, nil
+	addLabelLines(result, out, true)
+	return result, nil
+}
+
+func localBranchTipsJJ(repoRoot string) map[string]string {
+	result := make(map[string]string)
+	if bookmarks, err := jjCommandInDir(repoRoot, "bookmark", "list", "-T", "normal_target.commit_id() ++ \" \" ++ name ++ \"\\n\""); err == nil {
+		addLabelLines(result, bookmarks, true)
 	}
+	if drafts, err := jjCommandInDir(repoRoot, "log", "-r", jjTopicChainRevset(repoRoot, 0), "--no-graph", "-T", "commit_id ++ \" \" ++ description.first_line() ++ \"\\n\""); err == nil {
+		addLabelLines(result, drafts, false)
+	}
+	return result
+}
+
+func localBranchTipsSapling(repoRoot string) map[string]string {
+	result := make(map[string]string)
 	if bookmarks, err := slCommandInDir(repoRoot, "bookmarks", "-T", "{node} {bookmark}\n"); err == nil {
-		for _, line := range splitNonEmpty(bookmarks) {
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) == 2 {
-				result[parts[0]] = parts[1]
-			}
-		}
+		addLabelLines(result, bookmarks, true)
 	}
 	if drafts, err := slCommandInDir(repoRoot, "log", "-r", "draft()", "-T", "{node} {desc|firstline}\n"); err == nil {
-		for _, line := range splitNonEmpty(drafts) {
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) == 2 {
-				if _, ok := result[parts[0]]; !ok {
-					result[parts[0]] = parts[1]
-				}
-			}
-		}
+		addLabelLines(result, drafts, false)
 	}
-	return result, nil
+	return result
+}
+
+func addLabelLines(result map[string]string, output string, overwrite bool) {
+	for _, line := range splitNonEmpty(output) {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if _, ok := result[parts[0]]; ok && !overwrite {
+			continue
+		}
+		result[parts[0]] = parts[1]
+	}
 }
 
 // remoteBranchTips returns up to 20 remote branches sorted by recency,
